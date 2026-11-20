@@ -1,15 +1,76 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar: pre-token protocols ranked by implied value</title>
-<link rel="stylesheet" href="app.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Launch Radar — The pre-token ledger</title>
+  <link rel="stylesheet" href="app.css">
+  <script defer src="../data.js"></script>
+  <script defer src="app.js"></script>
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
-<script src="../data.js"></script>
-<script src="app.js"></script>
+  <div class="wrap">
+    <header class="masthead">
+      <a href="#" class="brand"><span class="brand-mark" aria-hidden="true">◈</span> LAUNCH RADAR</a>
+      <span class="mast-center">THE PRE-TOKEN LEDGER</span>
+      <span class="edition">SEALED EDITION / <span id="edition"></span></span>
+    </header>
+    <main>
+      <noscript><p>JavaScript is needed to read the local ledger and open protocol details.</p></noscript>
+      <p id="load-error" hidden>Could not load the ledger. Run the entrypoint and open the generated dashboard.</p>
+      <section id="overview" hidden>
+        <div class="headline">
+          <div>
+            <p class="eyebrow">RESEARCH DESK <span>/</span> TOKEN LAUNCHES</p>
+            <h1>The pre-token ledger<span>.</span></h1>
+            <p class="dek">Protocols with no token on record, ranked by fitted value and token odds.<br class="wide"> Every ranked name comes with a costed, six-step farm plan.</p>
+          </div>
+          <div class="radar-art" aria-hidden="true">
+            <div class="rings"></div><span class="ping p1"></span><span class="ping p2"></span><span class="ping p3"></span>
+            <span class="chart-top">FIG. 01 / COVERAGE</span><span class="chart-bottom" id="watch-cover"></span>
+          </div>
+        </div>
+        <section class="kpi" aria-label="Coverage and model test results" id="kpi"></section>
+        <div class="integrity" id="integrity"></div>
+        <section class="ledger" aria-labelledby="board-heading">
+          <header class="section-head">
+            <div><p class="eyebrow">01 / PROTOCOL INDEX</p><h2 id="board-heading">Launch board</h2></div>
+            <a class="method-link" href="#method">Read the fit &amp; assumptions <span aria-hidden="true">↘</span></a>
+          </header>
+          <nav class="views" aria-label="Protocol status">
+            <button type="button" data-view="ranked" aria-pressed="true">Ranked <span></span></button>
+            <button type="button" data-view="live" aria-pressed="false">Live tokens <span></span></button>
+            <button type="button" data-view="excluded" aria-pressed="false">Excluded <span></span></button>
+          </nav>
+          <div class="filters">
+            <label class="search">Find protocol<input id="search" type="search" placeholder="Search name or slug"></label>
+            <label>Category<select id="category"></select></label>
+            <label>Chain<select id="chain"></select></label>
+            <label>TVL band<select id="band">
+              <option value="">All sizes</option><option value="0">Under $100M</option><option value="1">$100M to &lt;$1B</option>
+              <option value="2">$1B to &lt;$5B</option><option value="3">$5B and over</option>
+            </select></label>
+            <button type="button" id="reset" class="quiet">Reset filters</button>
+          </div>
+          <div class="table-info"><p id="result" role="status"></p><p id="table-note"></p></div>
+          <div class="table-wrap">
+            <table id="board" aria-label="Protocols">
+              <thead></thead><tbody></tbody>
+            </table>
+          </div>
+          <div class="pager" aria-label="Board pagination">
+            <span id="page-info"></span><div><button type="button" id="prev">← Previous</button><button type="button" id="next">Next →</button></div>
+          </div>
+        </section>
+        <section id="method" class="method" aria-labelledby="method-heading">
+          <header class="section-head"><div><p class="eyebrow">02 / RESEARCH NOTES</p><h2 id="method-heading">How this radar is built</h2></div></header>
+          <div id="method-content"></div>
+        </section>
+      </section>
+      <section id="record" hidden aria-labelledby="record-name"></section>
+    </main>
+    <footer><span>LAUNCH RADAR / SNAPSHOT RESEARCH</span><span>Estimates, not quotes or confirmed rewards.</span></footer>
+  </div>
 </body>
 </html>
