@@ -1,382 +1,597 @@
 import { readFileSync } from 'node:fs';
 
-type Protocol = {
-  slug: string; name: string; category: string | null; chains: string[];
-  tvl_usd: number; change_7d: number | null; mcap_usd: number | null;
-  listed_at: string | null; gecko_id: string | null; symbol: string | null;
+export type Protocol = {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
 };
-type Snapshot = { as_of: string; source: string; watchlist: string[]; protocols: Protocol[] };
-type Peer = Protocol & { age_days: number; growth_pct: number; pre_token: boolean };
 
-const DAY_MS = 86_400_000;
-const MAX_VALUE = 1e14;
-const WINDOW = '2025-06-01';
-const VERSION_MARKER = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const compare = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
-const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value));
-const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
-const median = (values: number[]) => {
+export type Snapshot = {
+  as_of: string;
+  source: string;
+  floor_usd: number;
+  protocols: Protocol[];
+  watchlist: string[];
+};
+
+export type Observation = Protocol & {
+  age_days: number;
+  growth_pct: number;
+  records_token: boolean;
+};
+
+type FeatureSet = 'full' | 'tvl' | 'no-growth';
+type Parameters = Record<string, unknown>;
+type ValueFit = { predictLog: (row: Observation) => number; parameters: Parameters };
+type Trainer = (rows: Observation[]) => ValueFit;
+type Tuning = {
+  selected_lambda: number;
+  fit_slugs: string[];
+  validation_slugs: string[];
+  candidates: { lambda: number; validation_log_mse: number }[];
+};
+
+export const MODEL_VERSION = '2.0.0';
+export const CUTOFF = '2025-06-01';
+const PENALTIES = [0.01, 0.1, 1, 10, 100, 1000];
+const VERSION_SUFFIX = /\s(?:v\d+(?:\.\d+)?|\d+\.\d+)$/i;
+const OLD_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
+const OLD_EXCHANGE_PREFIX = /^(?:Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)/i;
+const MAX_VALUE = 100_000_000_000_000;
+
+export const eligibilityRules = [
+  'A live row records at least one of mcap_usd, gecko_id or symbol; live rows are never launch-ranked.',
+  'A pre-token row in category CEX is excluded: custodial exchange balances are not a farmable protocol.',
+  'A pre-token name ending in a space plus vN, vN.N or N.N is excluded as a versioned product.',
+  'A pre-token row in Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking or Restaked BTC is excluded as a bridge/wrapped/staked product per the brief.',
+  'A pre-token name containing the whole word wrapped, staked, staking or bridged (case-insensitive) is excluded as a bridge/wrapped/staked product.',
+  'A pre-token name beginning with Binance, Coinbase, Bybit, Kraken, Bitget, OKX, Bitfinex or Gemini (case-insensitive) is excluded as exchange-named.',
+  'Eligibility uses snapshot category/name evidence, not an exact live-parent match; no recorded token is not a promise of an independent token or a future launch.',
+];
+
+const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+const clamp = (value: number, minimum: number, maximum: number) => Math.max(minimum, Math.min(maximum, value));
+const average = (values: number[]) => values.reduce((total, value) => total + value, 0) / values.length;
+const dotProduct = (left: number[], right: number[]) => left.reduce((total, value, index) => total + value * right[index], 0);
+
+function median(values: number[]): number {
+  if (values.length === 0) throw new Error('Cannot take the median of an empty sample.');
   const sorted = [...values].sort((left, right) => left - right);
   return (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2;
-};
-const dot = (left: number[], right: number[]) => left.reduce((sum, value, index) => sum + value * right[index], 0);
-const isDate = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d\d-\d\d$/.test(value) &&
-  Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+}
 
-export function readSnapshot(path: string): Snapshot {
-  const input = JSON.parse(readFileSync(path, 'utf8')) as Snapshot;
-  if (!input || !isDate(input.as_of) || typeof input.source !== 'string' ||
-      !Array.isArray(input.protocols) || !Array.isArray(input.watchlist)) {
-    throw new Error('Snapshot needs an as_of date, a source, protocols, and a watchlist.');
+function validDate(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+}
+
+/** Validate the sealed input without consulting the clock, network or protocol identities. */
+export function readSnapshot(filename: string): Snapshot {
+  const snapshot = JSON.parse(readFileSync(filename, 'utf8')) as Snapshot;
+  if (!snapshot || !validDate(snapshot.as_of) || typeof snapshot.source !== 'string' ||
+      !Number.isFinite(snapshot.floor_usd) || !Array.isArray(snapshot.protocols) || !Array.isArray(snapshot.watchlist)) {
+    throw new Error('Invalid snapshot header: expected as_of, source, floor_usd, protocols and watchlist.');
   }
   const slugs = new Set<string>();
-  for (const peer of input.protocols) {
-    if (!peer || typeof peer.slug !== 'string' || !/^[^\s]{1,128}$/.test(peer.slug) ||
-        slugs.has(peer.slug) || typeof peer.name !== 'string' || !peer.name.trim() ||
-        ![peer.category, peer.gecko_id, peer.symbol].every(value => value === null || typeof value === 'string') ||
-        !Array.isArray(peer.chains) || !peer.chains.every(chain => typeof chain === 'string' && chain.trim()) ||
-        !Number.isFinite(peer.tvl_usd) || peer.tvl_usd < 0 ||
-        ![peer.change_7d, peer.mcap_usd].every(value => value === null || Number.isFinite(value)) ||
-        (peer.listed_at !== null && !isDate(peer.listed_at))) {
-      throw new Error(`Invalid or duplicate protocol: ${peer?.slug ?? '(no slug)'}`);
+  for (const row of snapshot.protocols) {
+    if (!row || typeof row.slug !== 'string' || !row.slug.trim() || slugs.has(row.slug) ||
+        typeof row.name !== 'string' || !row.name.trim() ||
+        ![row.category, row.gecko_id, row.symbol].every(value => value === null || typeof value === 'string') ||
+        !Array.isArray(row.chains) || !row.chains.every(chain => typeof chain === 'string' && chain.trim()) ||
+        !Number.isSafeInteger(row.tvl_usd) || row.tvl_usd < 0 ||
+        ![row.change_7d, row.mcap_usd].every(value => value === null || typeof value === 'number' && Number.isFinite(value)) ||
+        (row.listed_at !== null && (!validDate(row.listed_at) || row.listed_at > snapshot.as_of))) {
+      throw new Error(`Invalid or duplicate snapshot row: ${row?.slug ?? '(missing slug)'}.`);
     }
-    slugs.add(peer.slug);
+    slugs.add(row.slug);
   }
-  if (new Set(input.watchlist).size !== input.watchlist.length || !input.watchlist.every(slug => slugs.has(slug))) {
-    throw new Error('Watchlist must contain unique snapshot slugs.');
+  if (new Set(snapshot.watchlist).size !== snapshot.watchlist.length ||
+      !snapshot.watchlist.every(slug => typeof slug === 'string' && slugs.has(slug))) {
+    throw new Error('Watchlist must contain distinct snapshot slugs.');
   }
-  return { ...input, protocols: [...input.protocols].sort((left, right) => compare(left.slug, right.slug)) };
+  return snapshot;
 }
 
-function enrich(peer: Protocol, asOf: string): Peer {
-  return {
-    ...peer,
-    age_days: peer.listed_at === null ? 365 : Math.max(0, (Date.parse(asOf) - Date.parse(peer.listed_at)) / DAY_MS),
-    growth_pct: clamp(peer.change_7d ?? 0, -60, 120),
-    pre_token: peer.mcap_usd === null && peer.gecko_id === null && peer.symbol === null,
-  };
-}
-
-function exclusion(peer: Peer) {
-  if (peer.category === 'CEX') return 'CEX';
-  if (VERSION_MARKER.test(peer.name)) return 'versioned';
-  if (/^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)/i.test(peer.name)) return 'exchange-named';
-  if (['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC'].includes(peer.category ?? '') ||
-      /\b(wrapped|staked|staking)\b/i.test(peer.name)) return 'bridge-wrapped-staked';
-  return null;
-}
-
-export function isRankable(peer: Peer) {
-  return peer.pre_token && exclusion(peer) === null;
-}
-
-const logTvl = (peer: Peer) => Math.log10(Math.max(peer.tvl_usd, 1));
-const logAge = (peer: Peer) => Math.log10(peer.age_days + 1);
-const compsFeatures = (peer: Peer) => [1, logTvl(peer), peer.growth_pct / 100, logAge(peer)];
-const marketLog = (peer: Peer) => Math.log10(peer.mcap_usd!);
-
-/** Solve XᵀX β = Xᵀy with deterministic partial pivoting. */
-function solveNormal(features: number[][], targets: number[]): number[] {
-  const width = features[0].length;
-  const matrix = Array.from({ length: width }, () => Array<number>(width + 1).fill(0));
-  features.forEach((row, index) => {
-    for (let col = 0; col < width; col++) {
-      for (let other = 0; other < width; other++) matrix[col][other] += row[col] * row[other];
-      matrix[col][width] += row[col] * targets[index];
-    }
-  });
-  for (let col = 0; col < width; col++) {
-    let pivot = col;
-    for (let row = col + 1; row < width; row++) {
-      if (Math.abs(matrix[row][col]) > Math.abs(matrix[pivot][col])) pivot = row;
-    }
-    if (Math.abs(matrix[pivot][col]) < 1e-12) throw new Error('Comps fit has a singular design matrix.');
-    [matrix[col], matrix[pivot]] = [matrix[pivot], matrix[col]];
-    for (let row = col + 1; row < width; row++) {
-      const ratio = matrix[row][col] / matrix[col][col];
-      for (let idx = col; idx <= width; idx++) matrix[row][idx] -= ratio * matrix[col][idx];
-    }
-  }
-  const coefficients = Array<number>(width).fill(0);
-  for (let row = width - 1; row >= 0; row--) {
-    coefficients[row] = (matrix[row][width] - dot(coefficients, matrix[row])) / matrix[row][row];
-  }
-  return coefficients;
-}
-
-function fitComps(peers: Peer[]) {
-  if (peers.length < 4) throw new Error('Too few positive-cap, positive-TVL peers for comps.');
-  const coefficients = solveNormal(peers.map(compsFeatures), peers.map(marketLog));
-  const residuals = new Map<string | null, number[]>();
-  for (const peer of peers) {
-    const group = residuals.get(peer.category) ?? [];
-    group.push(marketLog(peer) - dot(coefficients, compsFeatures(peer)));
-    residuals.set(peer.category, group);
-  }
-  const offsets = new Map<string | null, number>();
-  for (const [category, group] of residuals) {
-    if (group.length < 5) continue;
-    group.sort((left, right) => left - right);
-    const median = (group[Math.floor((group.length - 1) / 2)] + group[Math.floor(group.length / 2)]) / 2;
-    offsets.set(category, clamp(median * 0.5, -0.3, 0.3));
-  }
-  const offset = (peer: Peer) => offsets.get(peer.category) ?? 0;
-  const predictLog = (peer: Peer) => clamp(dot(coefficients, compsFeatures(peer)) + offset(peer), 0, 14);
-  return { coefficients, offsets, offset, predictLog, predict: (peer: Peer) => 10 ** predictLog(peer) };
-}
-
-type ValueFit = { predictLog: (peer: Peer) => number; predict: (peer: Peer) => number };
-
-function fitTvlOnly(peers: Peer[]): ValueFit {
-  const coefficients = solveNormal(peers.map(peer => [1, logTvl(peer)]), peers.map(marketLog));
-  const predictLog = (peer: Peer) => clamp(dot(coefficients, [1, logTvl(peer)]), 0, 14);
-  return { predictLog, predict: peer => 10 ** predictLog(peer) };
-}
-
-function fitMedianRatio(peers: Peer[], useCategory: boolean): ValueFit {
-  const ratio = (peer: Peer) => peer.mcap_usd! / peer.tvl_usd;
-  const global = median(peers.map(ratio));
-  const groups = new Map<string | null, number[]>();
-  for (const peer of peers) {
-    const group = groups.get(peer.category) ?? [];
-    group.push(ratio(peer));
-    groups.set(peer.category, group);
-  }
-  const ratios = new Map([...groups].filter(([, group]) => group.length >= 5)
-    .map(([category, group]) => [category, median(group)]));
-  const predict = (peer: Peer) => clamp(peer.tvl_usd * (useCategory ? ratios.get(peer.category) ?? global : global), 1, MAX_VALUE);
-  return { predict, predictLog: peer => Math.log10(predict(peer)) };
-}
-
-function percentageErrors(fit: ValueFit, peers: Peer[]) {
-  return peers.map(peer => 100 * Math.abs(fit.predict(peer) / peer.mcap_usd! - 1));
-}
-
-function scoreComps(fit: ValueFit, peers: Peer[]) {
-  const baseline = mean(peers.map(marketLog));
-  const total = peers.reduce((sum, peer) => sum + (marketLog(peer) - baseline) ** 2, 0);
-  const residual = peers.reduce((sum, peer) => sum + (marketLog(peer) - fit.predictLog(peer)) ** 2, 0);
-  if (!(total > 0)) throw new Error('Cannot score comps without variation in held-out log market caps.');
-  const errors = percentageErrors(fit, peers);
-  return {
-    n_test: peers.length,
-    mape_pct: mean(errors),
-    mdape_pct: median(errors),
-    r2: 1 - residual / total,
-  };
-}
-
-const ODDS_ITERATIONS = 2000;
-const ODDS_RATE = 0.5;
-const oddsNumeric = (peer: Peer) => [logTvl(peer), logAge(peer), peer.growth_pct / 100];
-const sigmoid = (value: number) => 1 / (1 + Math.exp(-value));
-
-/** Learn normalization and the category vocabulary on the fit partition only. */
-function fitOdds(peers: Peer[]) {
-  const numeric = peers.map(oddsNumeric);
-  const means = numeric[0].map((_, index) => mean(numeric.map(row => row[index])));
-  const stds = means.map((center, index) => Math.sqrt(mean(numeric.map(row => (row[index] - center) ** 2))) || 1);
-  const groups = new Map<string, number>();
-  for (const { category } of peers) if (category !== null) groups.set(category, (groups.get(category) ?? 0) + 1);
-  const categories = [...groups].filter(([, count]) => count >= 30).map(([category]) => category).sort(compare);
-  const encode = (peer: Peer) => [1, ...oddsNumeric(peer).map((value, index) => (value - means[index]) / stds[index]),
-    ...categories.map(category => Number(peer.category === category))];
-  const features = peers.map(encode);
-  const labels = peers.map(peer => Number(!peer.pre_token));
-  const weights = Array<number>(features[0].length).fill(0);
-  const gradient = weights.slice();
-  for (let step = 0; step < ODDS_ITERATIONS; step++) {
-    gradient.fill(0);
-    features.forEach((row, index) => {
-      const error = sigmoid(dot(weights, row)) - labels[index];
-      for (let col = 0; col < row.length; col++) gradient[col] += error * row[col];
-    });
-    for (let col = 0; col < weights.length; col++) weights[col] -= ODDS_RATE * gradient[col] / peers.length;
-  }
-  const loss = mean(features.map((row, index) => {
-    const logit = dot(weights, row);
-    return Math.max(0, logit) - labels[index] * logit + Math.log1p(Math.exp(-Math.abs(logit)));
+function observe(snapshot: Snapshot): Observation[] {
+  return [...snapshot.protocols].sort((left, right) => compareText(left.slug, right.slug)).map(row => ({
+    ...row,
+    age_days: row.listed_at === null ? 365 : Math.max(0, (Date.parse(snapshot.as_of) - Date.parse(row.listed_at)) / 86_400_000),
+    growth_pct: clamp(row.change_7d ?? 0, -60, 120),
+    records_token: row.mcap_usd !== null || row.gecko_id !== null || row.symbol !== null,
   }));
-  return { predict: (peer: Peer) => sigmoid(dot(weights, encode(peer))), means, stds, weights, categories, loss };
 }
 
-/** AUC is the fraction of positive–negative pairs correctly ordered, with half credit for ties. */
-function auc(fit: ReturnType<typeof fitOdds>, peers: Peer[]) {
-  const positive = peers.filter(peer => !peer.pre_token).map(fit.predict);
-  const negative = peers.filter(peer => peer.pre_token).map(fit.predict);
-  if (!positive.length || !negative.length) throw new Error('Cannot compute AUC without both token classes.');
-  let credit = 0;
-  for (const above of positive) for (const below of negative) credit += above > below ? 1 : above === below ? 0.5 : 0;
-  return credit / (positive.length * negative.length);
+export function slugParity(slug: string): number {
+  return [...slug].reduce((total, character) => total + character.charCodeAt(0), 0) % 2;
 }
 
-function splitParity(slug: string) {
-  let hash = 0;
-  for (let index = 0; index < slug.length; index++) hash += slug.charCodeAt(index);
-  return hash % 2;
+/** This independent hash subdivides training only; outer-test labels never tune lambda. */
+export function innerValidation(slug: string): boolean {
+  return [...slug].reduce((total, character, index) => total + (index + 1) * character.charCodeAt(0), 0) % 5 === 0;
 }
 
-function heldOutTests(training: Peer[], universe: Peer[]) {
-  const [even, odd] = [0, 1].map(side => training.filter(peer => splitParity(peer.slug) === side));
-  const [oddsEven, oddsOdd] = [0, 1].map(side => universe.filter(peer => splitParity(peer.slug) === side));
-  const before = training.filter(peer => peer.listed_at !== null && peer.listed_at < WINDOW);
-  const after = training.filter(peer => peer.listed_at !== null && peer.listed_at >= WINDOW);
-  const variants = [
-    { name: 'OLS-full', fit: fitComps },
-    { name: 'OLS TVL-only', fit: fitTvlOnly },
-    { name: 'Per-category median mcap/TVL', fit: (peers: Peer[]) => fitMedianRatio(peers, true) },
-    { name: 'Global median mcap/TVL', fit: (peers: Peer[]) => fitMedianRatio(peers, false) },
+function featureNames(kind: FeatureSet): string[] {
+  if (kind === 'tvl') return ['log10(tvl_usd)'];
+  if (kind === 'no-growth') return ['log10(tvl_usd)', 'log10(age_days+1)'];
+  return ['log10(tvl_usd)', 'growth_pct/100', 'log10(age_days+1)'];
+}
+
+function rawFeatures(row: Observation, kind: FeatureSet): number[] {
+  const logTvl = Math.log10(Math.max(1, row.tvl_usd));
+  const logAge = Math.log10(row.age_days + 1);
+  if (kind === 'tvl') return [logTvl];
+  if (kind === 'no-growth') return [logTvl, logAge];
+  return [logTvl, row.growth_pct / 100, logAge];
+}
+
+const logCap = (row: Observation) => Math.log10(row.mcap_usd!);
+
+/** Deterministic partial-pivot elimination; all penalized columns are standardized. */
+function solveSystem(matrix: number[][], targets: number[]): number[] {
+  const width = targets.length;
+  const augmented = matrix.map((row, index) => [...row, targets[index]]);
+  for (let column = 0; column < width; column++) {
+    let pivot = column;
+    for (let candidate = column + 1; candidate < width; candidate++) {
+      if (Math.abs(augmented[candidate][column]) > Math.abs(augmented[pivot][column])) pivot = candidate;
+    }
+    if (Math.abs(augmented[pivot][column]) < 1e-12) throw new Error('Singular fitted design.');
+    [augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]];
+    for (let row = column + 1; row < width; row++) {
+      const multiplier = augmented[row][column] / augmented[column][column];
+      for (let entry = column; entry <= width; entry++) augmented[row][entry] -= multiplier * augmented[column][entry];
+    }
+  }
+  const solution = Array<number>(width).fill(0);
+  for (let row = width - 1; row >= 0; row--) {
+    let remainder = augmented[row][width];
+    for (let column = row + 1; column < width; column++) remainder -= augmented[row][column] * solution[column];
+    solution[row] = remainder / augmented[row][row];
+  }
+  return solution;
+}
+
+function weightedLeastSquares(features: number[][], targets: number[], weights: number[], penalty: number): number[] {
+  const width = features[0].length;
+  const gram = Array.from({ length: width }, () => Array<number>(width).fill(0));
+  const rhs = Array<number>(width).fill(0);
+  for (const [index, feature] of features.entries()) {
+    for (let column = 0; column < width; column++) {
+      rhs[column] += feature[column] * targets[index] * weights[index];
+      for (let other = 0; other < width; other++) gram[column][other] += feature[column] * feature[other] * weights[index];
+    }
+  }
+  for (let column = 1; column < width; column++) gram[column][column] += penalty;
+  return solveSystem(gram, rhs);
+}
+
+function fitLinear(rows: Observation[], kind: FeatureSet, penalty = 0, robust = false, withCategories = false): ValueFit {
+  if (rows.length < 5) throw new Error('Too few training observations.');
+  const raw = rows.map(row => rawFeatures(row, kind));
+  const means = raw[0].map((_, index) => average(raw.map(feature => feature[index])));
+  const scales = means.map((center, index) => Math.sqrt(average(raw.map(feature => (feature[index] - center) ** 2))) || 1);
+  const categories = withCategories ? [...new Set(rows.map(row => row.category ?? 'Uncategorized'))].sort(compareText) : [];
+  const encode = (row: Observation) => [1,
+    ...rawFeatures(row, kind).map((value, index) => (value - means[index]) / scales[index]),
+    ...categories.map(category => Number((row.category ?? 'Uncategorized') === category)),
   ];
-  const model_comparison = variants.map(variant => {
-    const fitA = variant.fit(even);
-    const fitB = variant.fit(odd);
-    const test = (fit: ValueFit, train: Peer[], holdout: Peer[]) => ({ n_train: train.length, ...scoreComps(fit, holdout) });
-    const pooled = [...percentageErrors(fitA, odd), ...percentageErrors(fitB, even)];
-    return { model: variant.name, primary: variant.name === 'OLS-full',
-      A_to_B: test(fitA, even, odd), B_to_A: test(fitB, odd, even),
-      walk_forward: { ...test(variant.fit(before), before, after), cutoff: WINDOW, n_unknown: training.length - before.length - after.length },
-      split_pooled_mape_pct: mean(pooled), split_pooled_mdape_pct: median(pooled) };
-  });
-  const primary = model_comparison[0];
+  const features = rows.map(encode);
+  const targets = rows.map(logCap);
+  let weights = rows.map(() => 1);
+  let coefficients: number[] = [];
+  let residualScale = 0;
+  for (let iteration = 0; iteration < (robust ? 60 : 1); iteration++) {
+    coefficients = weightedLeastSquares(features, targets, weights, penalty);
+    const residuals = targets.map((target, index) => target - dotProduct(features[index], coefficients));
+    const center = median(residuals);
+    residualScale = Math.max(0.05, 1.4826 * median(residuals.map(residual => Math.abs(residual - center))));
+    weights = residuals.map(residual => Math.min(1, 1.345 * residualScale / Math.max(1e-10, Math.abs(residual))));
+  }
   return {
-    model_comparison,
-    tests: {
-      A_to_B: primary.A_to_B, B_to_A: primary.B_to_A,
-      split_pooled_mape_pct: primary.split_pooled_mape_pct,
-      split_pooled_mdape_pct: primary.split_pooled_mdape_pct,
-      walk_forward: primary.walk_forward,
-      odds: {
-        A_to_B: { n_train: oddsEven.length, n_test: oddsOdd.length, auc: auc(fitOdds(oddsEven), oddsOdd) },
-        B_to_A: { n_train: oddsOdd.length, n_test: oddsEven.length, auc: auc(fitOdds(oddsOdd), oddsEven) },
-      },
+    predictLog: row => clamp(dotProduct(encode(row), coefficients), 0, 14),
+    parameters: {
+      kind, feature_names: ['intercept', ...featureNames(kind), ...categories.map(category => `category:${category}`)],
+      means, scales, coefficients, categories, lambda: penalty,
+      formula: 'log10(mcap) = intercept + sum(beta_j * (x_j - mean_j) / scale_j) + category_indicator_terms',
+      huber: robust ? { iterations: 60, delta: 1.345, mad_multiplier: 1.4826, minimum_scale: 0.05, residual_scale: residualScale } : null,
     },
   };
 }
 
-function growthContext(peers: Peer[]) {
-  const sorted = [...peers].sort((left, right) => (right.change_7d ?? 0) - (left.change_7d ?? 0) || compare(left.slug, right.slug));
-  const boundary = Math.ceil(sorted.length / 4);
-  const describe = (group: Peer[]) => ({ n: group.length, median_age_days: median(group.map(peer => peer.age_days)),
-    median_mcap_usd: median(group.map(peer => peer.mcap_usd!)) });
-  return { fastest_quartile: describe(sorted.slice(0, boundary)), remaining: describe(sorted.slice(boundary)) };
+function fitRidge(rows: Observation[], kind: FeatureSet = 'full', categories = false): ValueFit {
+  const fitRows = rows.filter(row => !innerValidation(row.slug));
+  const validationRows = rows.filter(row => innerValidation(row.slug));
+  if (fitRows.length < 5 || validationRows.length < 2) throw new Error('Inner training/validation split is too small.');
+  const candidates = PENALTIES.map(lambda => {
+    const fit = fitLinear(fitRows, kind, lambda, false, categories);
+    return { lambda, validation_log_mse: average(validationRows.map(row => (logCap(row) - fit.predictLog(row)) ** 2)) };
+  });
+  const winner = [...candidates].sort((left, right) => left.validation_log_mse - right.validation_log_mse || left.lambda - right.lambda)[0];
+  const finalFit = fitLinear(rows, kind, winner.lambda, false, categories);
+  const tuning: Tuning = {
+    selected_lambda: winner.lambda,
+    fit_slugs: fitRows.map(row => row.slug), validation_slugs: validationRows.map(row => row.slug), candidates,
+  };
+  return { ...finalFit, parameters: { ...finalFit.parameters, tuning } };
 }
 
-/** Budget for a full entry/exit cycle, not a live quote. Capital is not counted as gas. */
-const GAS: Readonly<Record<string, number>> = {
-  Ethereum: 8, Bitcoin: 6, Arbitrum: 2, Base: 1, Optimism: 1, Polygon: 1, Starknet: 2,
-  'zkSync Era': 2, Linea: 2, Scroll: 2, Mantle: 2, Solana: 0.5, Sui: 0.5,
-  Avalanche: 1, BSC: 1, 'Hyperliquid L1': 1, Tron: 3, Other: 3,
-};
-const FARM_SHARE = 0.10;
-const FARM_CAPITAL = 1_000_000;
-const money = (value: number) => `${value < 0 ? '−' : ''}$${Math.abs(value).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
-
-function farmRoute(category: string, dollars: string) {
-  if (/lending|^CDP/i.test(category)) return [ `supply ${dollars} of USDC without borrowing`, 'Verify the supplied balance and available withdrawal liquidity', 'redeem the supply receipt for USDC'];
-  if (/dex|yield|farming|liquidity manager|^farm$/i.test(category)) return [`provide ${dollars} of liquidity to a supported pool; prefer a stable pair`, 'Record the pool, asset ratio and LP receipt; track divergence from simply holding the assets', 'remove liquidity and reconcile both assets'];
-  if (/bridge/i.test(category)) return [`bridge ${dollars} of USDC to a supported destination; check the reverse route first`, 'Save the origin and destination receipts; confirm finality and the destination USDC contract', 'bridge the USDC back only if the route and fee still make sense'];
-  if (/staking|restaked/i.test(category)) return [`stake ${dollars} worth of the supported native asset without leverage`, 'Record staking receipt, unbonding delay and any slashing exposure', 'request unstaking and redeem when the exit window clears'];
-  if (/derivatives|perpetual|basis trading|options|synthetics/i.test(category)) return [`deposit ${dollars} of margin and place one small hedge against existing exposure, without leverage`, 'Log notional, funding, margin and liquidation level; skip if there is no exposure to hedge', 'close the hedge and withdraw free margin'];
-  if (/prediction/i.test(category)) return [`fund ${dollars} and place one small position on a market whose settlement rules you understand`, 'Keep unused collateral separate and note the oracle, resolution deadline and maximum loss', 'close or settle the position and withdraw the remaining collateral'];
-  if (/curator|allocator/i.test(category)) return [`deposit ${dollars} into a vault only if it accepts your asset and exits are open`, 'Save vault shares, allocation mix and withdrawal queue length', 'redeem vault shares or queue the withdrawal'];
-  if (/stable|reserve currency/i.test(category)) return [`mint or deposit ${dollars} of the supported stable asset; do not borrow`, 'Record the mint or deposit receipt and check redemption price and available liquidity', 'redeem the stable asset and review any peg loss'];
-  if (category === 'RWA') return [`mint ${dollars} of the eligible yield asset, only if you meet issuer restrictions`, 'Verify issuer, redemption window and any minimum or identity check before committing', 'request redemption under the issuer’s terms'];
-  if (category === 'Insurance') return [`use up to ${dollars} to buy cover for an existing position only after reading exclusions`, 'Save policy ID, premium, insured amount and claim deadline; treat the premium as spent', 'let cover expire or cancel only if the terms permit it'];
-  return [`deposit ${dollars} of USDC if a direct deposit is supported`, 'Record the balance or receipt and confirm the withdrawal path remains usable', 'withdraw the remaining USDC'];
+function residualGroups(rows: Observation[], fit: ValueFit): Map<string, number[]> {
+  const groups = new Map<string, number[]>();
+  for (const row of rows) {
+    const category = row.category ?? 'Uncategorized';
+    const residuals = groups.get(category) ?? [];
+    residuals.push(logCap(row) - fit.predictLog(row));
+    groups.set(category, residuals);
+  }
+  return groups;
 }
 
-function farmPlan(peer: Peer, implied: number) {
-  const deposit = peer.tvl_usd >= 5e9 ? 250 : peer.tvl_usd >= 1e9 ? 150 : peer.tvl_usd >= 1e8 ? 100 : 50;
-  const chain = peer.chains[0] ?? 'an unlisted chain';
-  const gas = Object.hasOwn(GAS, chain) ? GAS[chain] : GAS.Other;
-  const hold = peer.listed_at === null ? 30 : peer.age_days < 180 ? 60 : peer.age_days < 365 ? 45 : 30;
-  const premium = peer.category === 'Insurance' ? deposit : 0;
-  const costs = gas + premium;
-  const expected = Math.round(implied * FARM_SHARE * deposit / FARM_CAPITAL);
-  const net = expected - costs;
-  const [action, monitor, exit] = farmRoute(peer.category ?? '', money(deposit));
+/** Recreate the iteration-2 statistical baseline, not its source implementation. */
+function fitOlsBaseline(rows: Observation[]): ValueFit {
+  const global = fitLinear(rows, 'full');
+  const offsets = Object.fromEntries([...residualGroups(rows, global)].filter(([, group]) => group.length >= 5)
+    .map(([category, group]) => [category, clamp(0.5 * median(group), -0.3, 0.3)]));
   return {
-    farm: { deposit_usd: deposit, gas_usd: gas, premium_budget_usd: premium, total_cost_usd: costs,
-      hold_days: hold, expected_value_usd: expected, net_value_usd: net },
-    farm_steps: [
-      `Check that ${peer.name} on ${chain} supports this route, confirm the app and asset independently, and budget ${money(gas)} for round-trip gas. Skip if the route or quote cannot be verified.`,
-      `On ${chain}, ${action} through ${peer.name}. Stop if the minimum, eligibility or permissions exceed this plan.`,
-      `${monitor}. Save the transaction hash and check the actual fees against your budget.`,
-      `Monitor the position for up to ${hold} days${peer.listed_at === null ? ' (listing date unreported)' : ` (${peer.age_days} days since first tracked)`}. Check weekly; exit early if fees, liquidity or risk worsen.`,
-      `At exit, ${exit}. Save the final receipt, reconcile the actual cash flows and revoke any unused approvals.`,
-      `Expected value ≈ ${money(expected)} (10% of supply to farmers, ${money(deposit)} deposit vs $1M farmed capital); costs ≈ ${money(costs)}${premium ? ' including the premium budget' : ''}; net ≈ ${money(net)}. No allocation is confirmed.`,
-    ],
+    predictLog: row => clamp(global.predictLog(row) + (offsets[row.category ?? 'Uncategorized'] ?? 0), 0, 14),
+    parameters: { base: global.parameters, category_offsets: offsets, minimum_category_count: 5, median_shrinkage: 0.5, maximum_offset: 0.3 },
   };
 }
 
-export function buildRadar(snapshot: Snapshot) {
-  const all = snapshot.protocols.map(peer => enrich(peer, snapshot.as_of));
-  const live = all.filter(peer => !peer.pre_token).map(peer => ({ ...peer, token_status: 'live' as const }));
-  const excluded = all.flatMap(peer => {
-    const reason = peer.pre_token && exclusion(peer);
-    return reason ? [{ ...peer, reason, token_status: 'excluded' as const }] : [];
-  });
-  const training = live.filter(peer => (peer.mcap_usd ?? 0) > 0 && peer.tvl_usd > 0);
-  const comps = fitComps(training);
-  const odds = fitOdds(all);
-  const { tests, model_comparison } = heldOutTests(training, all);
-  const rows = all.filter(isRankable).map(peer => {
-    const fitted = comps.predict(peer);
-    const probability = odds.predict(peer);
-    const implied = clamp(Math.round(fitted * probability), 1, MAX_VALUE);
-    return { ...peer, implied_value_usd: implied, token_status: 'pre-token' as const,
-      model: { fitted_mcap_usd: fitted, token_odds: Number(probability.toFixed(4)), growth_pct: peer.growth_pct,
-        age_days: peer.age_days, category_offset: comps.offset(peer) }, ...farmPlan(peer, implied) };
-  }).sort((left, right) => right.implied_value_usd - left.implied_value_usd || compare(left.slug, right.slug))
-    .map((row, index) => ({ rank: index + 1, ...row }));
-
-  const [a, b, c, d] = comps.coefficients;
-  const meta = {
-    model_name: 'comps-fit', model_version: '1.0.0', as_of: snapshot.as_of, source: snapshot.source,
-    coefficients: { a, b, c, d }, r2_in_sample: scoreComps(comps, training).r2, model_tests: tests,
-    model_comparison, growth_context: growthContext(training),
-    odds_auc: auc(odds, all), odds_final_loss: odds.loss,
-    counts: { total: all.length, ranked: rows.length, live: live.length, excluded: excluded.length,
-      cex: excluded.filter(peer => peer.reason === 'CEX').length, versioned: excluded.filter(peer => peer.reason === 'versioned').length,
-      bridge_wrapped_staked: excluded.filter(peer => peer.reason === 'bridge-wrapped-staked').length,
-      exchange_named: excluded.filter(peer => peer.reason === 'exchange-named').length,
-      comps_training: training.length, watchlist: snapshot.watchlist.length },
-    assumptions: { airdrop_share: FARM_SHARE, farmed_capital_usd: FARM_CAPITAL, round_trip_gas_usd: GAS,
-      missing_age_days: 365, missing_growth_pct: 0, growth_clip_pct: [-60, 120] },
+/** Empirical category intercepts shrink by n/(n+10); a new category gets zero. */
+function fitCategoryShrinkage(rows: Observation[]): ValueFit {
+  const global = fitRidge(rows, 'tvl');
+  const offsets = Object.fromEntries([...residualGroups(rows, global)]
+    .map(([category, residuals]) => [category, average(residuals) * residuals.length / (residuals.length + 10)]));
+  return {
+    predictLog: row => clamp(global.predictLog(row) + (offsets[row.category ?? 'Uncategorized'] ?? 0), 0, 14),
+    parameters: { base: global.parameters, category_offsets: offsets, shrinkage_pseudocount: 10 },
   };
-  const model = {
-    comps: { category_offsets: [...comps.offsets].map(([category, offset]) => ({ category, offset })) },
-    odds: { features: ['intercept', 'log10(tvl)', 'log10(age+1)', 'growth/100', ...odds.categories],
-      means: odds.means, stds: odds.stds, weights: odds.weights, iterations: ODDS_ITERATIONS, learning_rate: ODDS_RATE },
-  };
-  return { rows, live, excluded, meta, model, watchlist: [...snapshot.watchlist].sort(compare) };
 }
 
-export function boardIssue(radar: ReturnType<typeof buildRadar>, snapshot: Snapshot): string | null {
-  const { rows, live, excluded } = radar;
-  const slugs = new Set(snapshot.protocols.map(peer => peer.slug));
-  const accounted = [...rows, ...live, ...excluded];
-  if (accounted.length !== slugs.size || new Set(accounted.map(row => row.slug)).size !== slugs.size ||
-      accounted.some(row => !slugs.has(row.slug))) return 'Protocol coverage is not an exact partition of the snapshot.';
-  const ranked = new Set(rows.map(row => row.slug));
-  const missing = snapshot.watchlist.filter(slug => !ranked.has(slug));
-  if (missing.length) return `Missing watchlist slugs: ${missing.join(', ')}`;
-  const expectedRanked = snapshot.protocols.filter(peer => {
-    const record = enrich(peer, snapshot.as_of);
-    return isRankable(record);
-  });
-  if (expectedRanked.length !== rows.length || expectedRanked.some(peer => !ranked.has(peer.slug))) {
-    return 'Ranked rows do not exactly cover eligible pre-token protocols.';
-  }
-  if (rows.length < 100 || rows.length > 4000) return `Rank count ${rows.length} is outside 100–4000.`;
+/** Medians are taken in log space, not after exponentiating ratios. */
+function fitCategoryMedian(rows: Observation[]): ValueFit {
+  const groups = new Map<string, number[]>();
+  const ratios = rows.map(row => logCap(row) - Math.log10(row.tvl_usd));
   for (const [index, row] of rows.entries()) {
-    if (row.rank !== index + 1) return `Invalid rank for ${row.slug}.`;
-    const value = row.implied_value_usd;
-    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_VALUE ||
-        (index > 0 && value > rows[index - 1].implied_value_usd)) return `Invalid or out-of-order value for ${row.slug}.`;
-    if (row.farm_steps.length !== 6 || row.farm_steps.some(step => typeof step !== 'string' ||
-        step.trim().length < 20 || step.trim().length > 600)) return `Invalid farm steps for ${row.slug}.`;
+    const category = row.category ?? 'Uncategorized';
+    groups.set(category, [...(groups.get(category) ?? []), ratios[index]]);
   }
-  if (rows[0].implied_value_usd === rows.at(-1)!.implied_value_usd) return 'Every implied value is identical.';
+  const globalMedian = median(ratios);
+  const categoryMedians = Object.fromEntries([...groups].filter(([, group]) => group.length >= 5)
+    .map(([category, group]) => [category, median(group)]));
+  return {
+    predictLog: row => clamp(Math.log10(row.tvl_usd) + (categoryMedians[row.category ?? 'Uncategorized'] ?? globalMedian), 0, 14),
+    parameters: {
+      formula: 'log10(mcap) = log10(tvl) + median(log10(mcap/tvl)); category n>=5 else global',
+      global_median_log_ratio: globalMedian, category_median_log_ratios: categoryMedians, minimum_category_count: 5,
+    },
+  };
+}
+
+const variants: { name: string; rationale: string; train: Trainer }[] = [
+  { name: 'OLS-full', rationale: 'Iteration-2 baseline: TVL, growth, age plus clipped median category residuals.', train: fitOlsBaseline },
+  { name: 'OLS TVL-only', rationale: 'Lower-variance single predictor, no category offset.', train: rows => fitLinear(rows, 'tvl') },
+  { name: 'Ridge-full', rationale: 'Standardized numeric features; L2 lambda selected strictly inside training.', train: rows => fitRidge(rows) },
+  { name: 'Huber-full', rationale: 'IRLS on log market cap with Huber delta 1.345 and training-only MAD scale.', train: rows => fitLinear(rows, 'full', 0, true) },
+  { name: 'Category intercept shrinkage', rationale: 'TVL ridge plus training residual category means shrunk by n/(n+10).', train: fitCategoryShrinkage },
+  { name: 'Category median log ratio', rationale: 'Category median log10(mcap/tvl), n>=5; global median fallback.', train: fitCategoryMedian },
+  { name: 'Ridge without growth', rationale: 'Ablation of the volatile 7-day feature; identical inner lambda selection.', train: rows => fitRidge(rows, 'no-growth') },
+  { name: 'Ridge with category indicators', rationale: 'Jointly penalize numeric effects and category indicators, vocabulary learned on training only.', train: rows => fitRidge(rows, 'full', true) },
+];
+
+function assessFit(fit: ValueFit, rows: Observation[]) {
+  const actualMean = average(rows.map(logCap));
+  const predictions = rows.map(row => {
+    const prediction = fit.predictLog(row);
+    return {
+      slug: row.slug, actual_mcap_usd: row.mcap_usd!, predicted_log10_mcap: prediction,
+      predicted_mcap_usd: 10 ** prediction, absolute_percentage_error: 100 * Math.abs(10 ** prediction / row.mcap_usd! - 1),
+    };
+  });
+  const squaredError = predictions.reduce((total, row) => total + (Math.log10(row.actual_mcap_usd) - row.predicted_log10_mcap) ** 2, 0);
+  const totalVariation = rows.reduce((total, row) => total + (logCap(row) - actualMean) ** 2, 0);
+  if (!(totalVariation > 0)) throw new Error('Log R² requires a varying target.');
+  return {
+    n_test: rows.length, log_r2: 1 - squaredError / totalVariation,
+    mape_pct: average(predictions.map(row => row.absolute_percentage_error)),
+    mdape_pct: median(predictions.map(row => row.absolute_percentage_error)), predictions,
+  };
+}
+
+function evaluatePartition(train: Trainer, training: Observation[], test: Observation[]) {
+  const fit = train(training);
+  return { n_train: training.length, training_slugs: training.map(row => row.slug), fit: fit.parameters, ...assessFit(fit, test) };
+}
+
+/** Every candidate sees exactly the same three outer holdouts. Missing dates never enter the walk-forward. */
+export function evaluateModels(snapshot: Snapshot) {
+  const traded = observe(snapshot).filter(row => row.records_token && (row.mcap_usd ?? 0) > 0 && row.tvl_usd > 0);
+  const halfA = traded.filter(row => slugParity(row.slug) === 0);
+  const halfB = traded.filter(row => slugParity(row.slug) === 1);
+  const early = traded.filter(row => row.listed_at !== null && row.listed_at < CUTOFF);
+  const late = traded.filter(row => row.listed_at !== null && row.listed_at >= CUTOFF);
+  const comparison = variants.map(variant => {
+    const inSample = evaluatePartition(variant.train, traded, traded);
+    const forward = evaluatePartition(variant.train, halfA, halfB);
+    const reverse = evaluatePartition(variant.train, halfB, halfA);
+    const walk = evaluatePartition(variant.train, early, late);
+    const pooled = [...forward.predictions, ...reverse.predictions].map(row => row.absolute_percentage_error);
+    return {
+      model: variant.name, rationale: variant.rationale,
+      in_sample_r2: inSample.log_r2, in_sample: inSample,
+      A_to_B: forward, B_to_A: reverse,
+      walk_forward: { ...walk, cutoff: CUTOFF, n_unknown: traded.length - early.length - late.length },
+      mean_held_out_log_r2: average([forward.log_r2, reverse.log_r2, walk.log_r2]),
+      split_pooled_mape_pct: average(pooled), split_pooled_mdape_pct: median(pooled),
+      passes_fit_gate: forward.log_r2 > 0 && reverse.log_r2 > 0 && walk.log_r2 > 0,
+    };
+  });
+  const selected = [...comparison].sort((left, right) => right.mean_held_out_log_r2 - left.mean_held_out_log_r2 || compareText(left.model, right.model))[0];
+  return {
+    model_version: MODEL_VERSION, as_of: snapshot.as_of, source: snapshot.source,
+    status: selected.passes_fit_gate ? 'fit_gate_passed' : 'fit_gate_failed',
+    primary_candidate: selected.model, deployed_primary: selected.passes_fit_gate ? selected.model : null,
+    selection_rule: 'Highest unweighted mean of A→B, B→A and walk-forward Log R²; ties by model name. No candidate deploys unless all three Log R² values are strictly positive.',
+    evaluation: {
+      outer_split: 'sum of slug character codes mod 2: A=0, B=1',
+      inner_validation: 'sum((character_index+1)*character_code) mod 5 = 0, applied only inside each training partition',
+      lambda_grid: PENALTIES, ridge_objective: 'sum squared log errors + lambda*sum(beta_j^2), intercept unpenalized',
+      normalization: 'population mean/std fitted on that training partition only; category vocabulary from training only',
+      ridge_selection: 'Minimum inner-validation log MSE; lower lambda breaks exact ties; refit on all outer-training rows.',
+      target: 'log10(mcap_usd)', prediction_log_clip: [0, 14],
+      growth_clip_pct: [-60, 120], missing_growth_pct: 0, missing_age_days: 365,
+      mape_definition: '100*mean(abs(predicted_mcap/actual_mcap-1))',
+      log_r2_definition: '1 - sum((actual_log-predicted_log)^2)/sum((actual_log-mean(actual_log_in_test))^2)',
+      selection_caveat: 'Outer scores select among eight candidates; they are not a fresh unbiased test of the selected candidate.',
+      walk_forward_caveat: 'Listing chronology is not historical snapshot backtesting: all covariates and labels are observed as of the same sealed snapshot.',
+      n_traded: traded.length, n_A: halfA.length, n_B: halfB.length,
+      n_walk_train: early.length, n_walk_test: late.length, n_unknown_listing_date: traded.length - early.length - late.length,
+    },
+    model_comparison: comparison.map(row => ({ ...row, primary: row.model === selected.model })),
+    passing_candidates: comparison.filter(row => row.passes_fit_gate).map(row => row.model),
+    token_odds: { status: 'not_rebuilt', reason: 'Stop at failed comps-fit gate before odds, board, dashboard and screenshot production.' },
+  };
+}
+
+export type ModelReport = ReturnType<typeof evaluateModels>;
+
+const ODDS_ITERATIONS = 2_000;
+const ODDS_LEARNING_RATE = 0.001;
+const LARGE_CATEGORY_MIN_COUNT = 20;
+
+type LogisticFit = {
+  coefficients: number[];
+  featureNames: string[];
+  categories: string[];
+  predict: (row: Observation) => number;
+};
+
+function sigmoid(value: number): number {
+  if (value >= 0) return 1 / (1 + Math.exp(-value));
+  const exponential = Math.exp(value);
+  return exponential / (1 + exponential);
+}
+
+function logisticFeatures(row: Observation, categories: string[]): number[] {
+  const category = row.category ?? 'Uncategorized';
+  return [1, Math.log10(Math.max(1, row.tvl_usd)), Math.log10(row.age_days + 1), row.growth_pct,
+    ...categories.map(value => Number(value === category))];
+}
+
+function fitLogistic(rows: Observation[]): LogisticFit {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const category = row.category ?? 'Uncategorized';
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  const categories = [...counts].filter(([, count]) => count >= LARGE_CATEGORY_MIN_COUNT)
+    .map(([category]) => category).sort(compareText);
+  const featureNames = ['intercept', 'log10(tvl_usd)', 'log10(age_days+1)', 'growth_pct',
+    ...categories.map(category => `category:${category}`)];
+  const features = rows.map(row => logisticFeatures(row, categories));
+  const labels = rows.map(row => Number(row.records_token));
+  const coefficients = Array<number>(featureNames.length).fill(0);
+  for (let iteration = 0; iteration < ODDS_ITERATIONS; iteration++) {
+    const gradient = Array<number>(featureNames.length).fill(0);
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      const error = sigmoid(dotProduct(features[rowIndex], coefficients)) - labels[rowIndex];
+      for (let featureIndex = 0; featureIndex < gradient.length; featureIndex++) {
+        gradient[featureIndex] += error * features[rowIndex][featureIndex];
+      }
+    }
+    for (let featureIndex = 0; featureIndex < coefficients.length; featureIndex++) {
+      coefficients[featureIndex] -= ODDS_LEARNING_RATE * gradient[featureIndex] / rows.length;
+    }
+  }
+  return {
+    coefficients, featureNames, categories,
+    predict: row => sigmoid(dotProduct(logisticFeatures(row, categories), coefficients)),
+  };
+}
+
+function areaUnderCurve(labels: number[], scores: number[]): number {
+  const ordered = labels.map((label, index) => ({ label, score: scores[index] }))
+    .sort((left, right) => left.score - right.score);
+  const positives = labels.reduce((count, label) => count + label, 0);
+  const negatives = labels.length - positives;
+  if (!positives || !negatives) throw new Error('Token-odds AUC requires both outcome classes.');
+  let positiveRankSum = 0;
+  for (let start = 0; start < ordered.length;) {
+    let end = start + 1;
+    while (end < ordered.length && ordered[end].score === ordered[start].score) end++;
+    const meanRank = ((start + 1) + end) / 2;
+    for (let index = start; index < end; index++) positiveRankSum += ordered[index].label * meanRank;
+    start = end;
+  }
+  return (positiveRankSum - positives * (positives + 1) / 2) / (positives * negatives);
+}
+
+export type TokenOddsReport = {
+  status: 'built';
+  target: string;
+  features: string[];
+  large_category_min_count: number;
+  large_categories: string[];
+  coefficients: Record<string, number>;
+  iterations: number;
+  learning_rate: number;
+  initialization: string;
+  optimization: string;
+  sample_counts: { total: number; token: number; no_token: number; A: number; B: number };
+  in_sample_auc: number;
+  held_out_auc: { A_to_B: number; B_to_A: number; pooled_out_of_fold: number };
+};
+
+export function fitTokenOdds(snapshot: Snapshot): { report: TokenOddsReport; probabilities: Map<string, number> } {
+  const rows = observe(snapshot);
+  const labels = rows.map(row => Number(row.records_token));
+  const fullFit = fitLogistic(rows);
+  const fullScores = rows.map(row => fullFit.predict(row));
+  const halfA = rows.filter(row => slugParity(row.slug) === 0);
+  const halfB = rows.filter(row => slugParity(row.slug) === 1);
+  const fitA = fitLogistic(halfA);
+  const fitB = fitLogistic(halfB);
+  const scoresAtoB = halfB.map(row => fitA.predict(row));
+  const scoresBtoA = halfA.map(row => fitB.predict(row));
+  const labelsA = halfB.map(row => Number(row.records_token));
+  const labelsB = halfA.map(row => Number(row.records_token));
+  const report: TokenOddsReport = {
+    status: 'built',
+    target: '1 when mcap_usd, gecko_id or symbol is non-null; otherwise 0',
+    features: fullFit.featureNames,
+    large_category_min_count: LARGE_CATEGORY_MIN_COUNT,
+    large_categories: fullFit.categories,
+    coefficients: Object.fromEntries(fullFit.featureNames.map((name, index) => [name, fullFit.coefficients[index]])),
+    iterations: ODDS_ITERATIONS,
+    learning_rate: ODDS_LEARNING_RATE,
+    initialization: 'all coefficients zero',
+    optimization: 'batch gradient descent on mean binary cross-entropy; unscaled numeric inputs; category indicators for categories with at least 20 training rows',
+    sample_counts: {
+      total: rows.length, token: labels.reduce((total, label) => total + label, 0),
+      no_token: labels.length - labels.reduce((total, label) => total + label, 0), A: halfA.length, B: halfB.length,
+    },
+    in_sample_auc: areaUnderCurve(labels, fullScores),
+    held_out_auc: {
+      A_to_B: areaUnderCurve(labelsA, scoresAtoB),
+      B_to_A: areaUnderCurve(labelsB, scoresBtoA),
+      pooled_out_of_fold: areaUnderCurve([...labelsA, ...labelsB], [...scoresAtoB, ...scoresBtoA]),
+    },
+  };
+  return { report, probabilities: new Map(rows.map((row, index) => [row.slug, fullScores[index]])) };
+}
+
+function oldExclusion(row: Observation): string | null {
+  if (row.records_token) return null;
+  if (row.category === 'CEX') return 'CEX';
+  if (VERSION_SUFFIX.test(row.name)) return 'versioned';
+  if (OLD_EXCHANGE_PREFIX.test(row.name)) return 'exchange-named';
+  if (OLD_CATEGORIES.has(row.category ?? '') || /\b(?:wrapped|staked|staking|bridged)\b/i.test(row.name)) return 'bridge-wrapped-staked';
+  return null;
+}
+
+function exclusionReason(row: Observation): string | null {
+  switch (oldExclusion(row)) {
+    case 'CEX': return 'CEX: This custodial exchange balance sheet is not a farmable protocol.';
+    case 'versioned': return 'versioned: This name ends in vN, vN.N or N.N and identifies a versioned product, not a separate launch identity.';
+    case 'exchange-named': return 'exchange-named: This name begins with an exchange prefix and is excluded as an exchange product under the brief.';
+    case 'bridge-wrapped-staked': return 'bridge-wrapped-staked: This category or whole-word name modifier identifies a bridge, wrapped or staked product excluded under the brief.';
+    default: return null;
+  }
+}
+
+export function auditCoverage(snapshot: Snapshot) {
+  const rows = observe(snapshot);
+  const live = rows.filter(row => row.records_token);
+  const decisions = rows.map(row => ({ ...row, exclusion_reason: exclusionReason(row), previous_rule: oldExclusion(row) }));
+  const eligible = decisions.filter(row => !row.records_token && row.exclusion_reason === null);
+  const excluded = decisions.filter(row => row.exclusion_reason !== null);
+  const exclusionLabels = ['CEX', 'versioned', 'bridge-wrapped-staked', 'exchange-named'];
+  const exclusionCounts = Object.fromEntries(exclusionLabels.map(rule =>
+    [rule, excluded.filter(row => row.previous_rule === rule).length]));
+  const exclusionCategories = Object.fromEntries(exclusionLabels.map(rule => {
+    const categories = new Map<string, number>();
+    for (const row of excluded.filter(row => row.previous_rule === rule)) {
+      const category = row.category ?? 'Uncategorized';
+      categories.set(category, (categories.get(category) ?? 0) + 1);
+    }
+    return [rule, Object.fromEntries([...categories].sort(([left], [right]) => compareText(left, right)))];
+  }));
+  const audit = decisions.filter(row => row.previous_rule === 'bridge-wrapped-staked' || row.previous_rule === 'exchange-named')
+    .map(row => ({
+      slug: row.slug, name: row.name, category: row.category, tvl_usd: row.tvl_usd, chains: row.chains,
+      previous_rule: row.previous_rule, decision: row.exclusion_reason ? 'excluded' : 'eligible',
+      reason: row.exclusion_reason,
+      warning: 'Re-included in the initial iteration-3 board, then excluded again by the restored broad rules; no independent token opportunity is asserted.',
+    }));
+  const rankedSlugs = new Set(eligible.map(row => row.slug));
+  return {
+    model_version: MODEL_VERSION, as_of: snapshot.as_of, rules: eligibilityRules,
+    status: 'eligibility_partition_applied_to_board',
+    counts: {
+      total: rows.length, eligible: eligible.length, live: live.length, excluded: excluded.length,
+      cex: exclusionCounts.CEX,
+      versioned: exclusionCounts.versioned,
+      bridge_wrapped_staked: exclusionCounts['bridge-wrapped-staked'],
+      exchange_named: exclusionCounts['exchange-named'],
+      audited: audit.length, re_included: audit.filter(row => row.decision === 'eligible').length,
+      audit_still_excluded: audit.filter(row => row.decision === 'excluded').length,
+      previous_bridge_wrapped_staked: audit.filter(row => row.previous_rule === 'bridge-wrapped-staked').length,
+      previous_exchange_named: audit.filter(row => row.previous_rule === 'exchange-named').length,
+    },
+    exclusion_counts: exclusionCounts,
+    exclusion_counts_by_category: exclusionCategories,
+    all_watchlist_eligible: snapshot.watchlist.every(slug => rankedSlugs.has(slug)),
+    watchlist_count: snapshot.watchlist.length,
+    eligible_slugs: eligible.map(row => row.slug), live_slugs: live.map(row => row.slug),
+    excluded: excluded.map(row => ({ slug: row.slug, name: row.name, category: row.category, rule: row.previous_rule, reason: row.exclusion_reason })),
+    audited_protocols: audit,
+  };
+}
+
+export function fitGateIssue(report: ModelReport): string | null {
+  const primary = report.model_comparison.find(row => row.primary);
+  if (!primary) return 'No primary candidate selected.';
+  const failures = [
+    ['A→B', primary.A_to_B.log_r2], ['B→A', primary.B_to_A.log_r2], ['walk-forward', primary.walk_forward.log_r2],
+  ].filter(([, value]) => typeof value !== 'number' || !Number.isFinite(value) || value <= 0);
+  if (failures.length) return `${primary.model}: ${failures.map(([name, value]) => `${name} Log R²=${value}`).join('; ')}. All three must be > 0. No board, dashboard or dossier is authorized.`;
+  return null;
+}
+
+type Board = {
+  rows: { slug: string; rank: number; implied_value_usd: number; farm_steps: string[] }[];
+  live: { slug: string }[];
+  excluded: { slug: string; reason: string }[];
+};
+
+/** A future successful fit still must satisfy every independent board contract. */
+export function boardIssue(board: Board, snapshot: Snapshot, report: ModelReport): string | null {
+  void report;
+  const expectedSlugs = new Set(snapshot.protocols.map(row => row.slug));
+  const accounted = [...board.rows, ...board.live, ...board.excluded].map(row => row.slug);
+  if (accounted.length !== expectedSlugs.size || new Set(accounted).size !== expectedSlugs.size ||
+      accounted.some(slug => !expectedSlugs.has(slug))) return 'Coverage is not an exact partition of the snapshot.';
+  const rankedSlugs = new Set(board.rows.map(row => row.slug));
+  if (snapshot.watchlist.some(slug => !rankedSlugs.has(slug))) return 'A watchlist protocol is missing from ranked rows.';
+  const coverage = auditCoverage(snapshot);
+  if (coverage.eligible_slugs.length !== board.rows.length || coverage.eligible_slugs.some(slug => !rankedSlugs.has(slug))) return 'Ranked rows differ from eligible protocols.';
+  const values = new Set<number>();
+  for (const [index, row] of board.rows.entries()) {
+    if (row.rank !== index + 1) return `Ranks are not exactly 1..N at ${row.slug}.`;
+    if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd < 1 || row.implied_value_usd > MAX_VALUE ||
+        (index > 0 && row.implied_value_usd > board.rows[index - 1].implied_value_usd) || values.has(row.implied_value_usd)) return `Invalid, tied or out-of-order value at ${row.slug}.`;
+    values.add(row.implied_value_usd);
+    if (!Array.isArray(row.farm_steps) || row.farm_steps.length !== 6 || row.farm_steps.some(step =>
+      typeof step !== 'string' || step.trim().length < 20 || step.trim().length > 600)) return `Invalid farm steps at ${row.slug}.`;
+  }
+  if (board.excluded.some(row => !row.reason?.trim())) return 'Every exclusion must display a reason.';
+  if (board.live.length !== coverage.counts.live || board.live.some(row => !coverage.live_slugs.includes(row.slug))) return 'Live partition does not match recorded token evidence.';
   return null;
 }
