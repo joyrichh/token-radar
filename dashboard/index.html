@@ -2,75 +2,117 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Launch Radar — The pre-token ledger</title>
+  <title>Launch Radar — token opportunity board</title>
   <link rel="stylesheet" href="app.css">
-  <script defer src="../data.js"></script>
-  <script defer src="app.js"></script>
+  <script src="../data.js" defer></script>
+  <script src="app.js" defer></script>
 </head>
 <body>
-  <div class="wrap">
-    <header class="masthead">
-      <a href="#" class="brand"><span class="brand-mark" aria-hidden="true">◈</span> LAUNCH RADAR</a>
-      <span class="mast-center">THE PRE-TOKEN LEDGER</span>
-      <span class="edition">SEALED EDITION / <span id="edition"></span></span>
-    </header>
-    <main>
-      <noscript><p>JavaScript is needed to read the local ledger and open protocol details.</p></noscript>
-      <p id="load-error" hidden>Could not load the ledger. Run the entrypoint and open the generated dashboard.</p>
-      <section id="overview" hidden>
-        <div class="headline">
-          <div>
-            <p class="eyebrow">RESEARCH DESK <span>/</span> TOKEN LAUNCHES</p>
-            <h1>The pre-token ledger<span>.</span></h1>
-            <p class="dek">Protocols with no token on record, ranked by fitted value and token odds.<br class="wide"> Every ranked name comes with a costed, six-step farm plan.</p>
-          </div>
-          <div class="radar-art" aria-hidden="true">
-            <div class="rings"></div><span class="ping p1"></span><span class="ping p2"></span><span class="ping p3"></span>
-            <span class="chart-top">FIG. 01 / COVERAGE</span><span class="chart-bottom" id="watch-cover"></span>
-          </div>
-        </div>
-        <section class="kpi" aria-label="Coverage and model test results" id="kpi"></section>
-        <div class="integrity" id="integrity"></div>
-        <section class="ledger" aria-labelledby="board-heading">
-          <header class="section-head">
-            <div><p class="eyebrow">01 / PROTOCOL INDEX</p><h2 id="board-heading">Launch board</h2></div>
-            <a class="method-link" href="#method">Read the fit &amp; assumptions <span aria-hidden="true">↘</span></a>
-          </header>
-          <nav class="views" aria-label="Protocol status">
-            <button type="button" data-view="ranked" aria-pressed="true">Ranked <span></span></button>
-            <button type="button" data-view="live" aria-pressed="false">Live tokens <span></span></button>
-            <button type="button" data-view="excluded" aria-pressed="false">Excluded <span></span></button>
-          </nav>
-          <div class="filters">
-            <label class="search">Find protocol<input id="search" type="search" placeholder="Search name or slug"></label>
-            <label>Category<select id="category"></select></label>
-            <label>Chain<select id="chain"></select></label>
-            <label>TVL band<select id="band">
-              <option value="">All sizes</option><option value="0">Under $100M</option><option value="1">$100M to &lt;$1B</option>
-              <option value="2">$1B to &lt;$5B</option><option value="3">$5B and over</option>
-            </select></label>
-            <button type="button" id="reset" class="quiet">Reset filters</button>
-          </div>
-          <div class="table-info"><p id="result" role="status"></p><p id="table-note"></p></div>
-          <div class="table-wrap">
-            <table id="board" aria-label="Protocols">
-              <thead></thead><tbody></tbody>
-            </table>
-          </div>
-          <div class="pager" aria-label="Board pagination">
-            <span id="page-info"></span><div><button type="button" id="prev">← Previous</button><button type="button" id="next">Next →</button></div>
-          </div>
-        </section>
-        <section id="method" class="method" aria-labelledby="method-heading">
-          <header class="section-head"><div><p class="eyebrow">02 / RESEARCH NOTES</p><h2 id="method-heading">How this radar is built</h2></div></header>
-          <div id="method-content"></div>
-        </section>
-      </section>
-      <section id="record" hidden aria-labelledby="record-name"></section>
-    </main>
-    <footer><span>LAUNCH RADAR / SNAPSHOT RESEARCH</span><span>Estimates, not quotes or confirmed rewards.</span></footer>
-  </div>
+  <header class="masthead">
+    <div class="brand-lockup"><span class="seal">LR</span><div><p class="eyebrow">Independent research · sealed snapshot</p><h1>Launch Radar</h1></div></div>
+    <div class="issue"><span class="live-dot"></span> TOKEN OPPORTUNITY INDEX <span class="issue-date">14 NOV 2026</span></div>
+  </header>
+
+  <section class="scorecard" id="kpi" aria-label="Model and coverage summary">
+    <p class="scoreline" id="scoreline"></p>
+    <div class="kpi-grid">
+      <div class="kpi-cell"><span>ACCOUNTED</span><strong id="coverage-kpi"></strong></div>
+      <div class="kpi-cell"><span>RANKED / LIVE / EXCLUDED</span><strong id="partitions-kpi"></strong></div>
+      <div class="kpi-cell"><span>COMPS · IN-SAMPLE R²</span><strong id="r2-kpi"></strong></div>
+      <div class="kpi-cell"><span>TOKEN ODDS · AUC</span><strong id="auc-kpi"></strong></div>
+      <div class="kpi-cell"><span>SNAPSHOT</span><strong id="date-kpi"></strong></div>
+    </div>
+    <div class="heldout-line" id="heldout-kpi"></div>
+  </section>
+
+  <section class="integrity" aria-label="Data and model integrity">
+    <span><b>Source</b> <i id="source-line"></i></span>
+    <span><b>Fit</b> <i id="formula-line"></i></span>
+    <span><b>Coverage</b> eligible rows use the same fitted functions; wrapped, bridge, and staked products are excluded per the brief</span>
+    <span><b>Repeatability</b> deterministic: two runs write identical bytes</span>
+    <span class="caveat"><b>Walk-forward</b> Log R² is −0.421; three outliers dominate the 20-row test and this limitation is not hidden</span>
+  </section>
+
+  <main>
+    <section id="overview" class="board-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">The opportunity ledger</p><h2>Protocol board</h2></div>
+        <p class="section-note">Snapshot evidence, modeled value, and a costed interaction plan. Not a token-launch prediction.</p>
+      </div>
+
+      <nav class="view-tabs" aria-label="Protocol status">
+        <button type="button" data-view="ranked" class="active">Ranked <span id="ranked-tab"></span></button>
+        <button type="button" data-view="live">Live tokens <span id="live-tab"></span></button>
+        <button type="button" data-view="excluded">Excluded <span id="excluded-tab"></span></button>
+      </nav>
+
+      <div class="filters">
+        <label class="search-field">Find protocol<input id="search" type="search" placeholder="Name or slug" autocomplete="off"></label>
+        <label>Category<select id="category"><option value="">All categories</option></select></label>
+        <label>Chain<select id="chain"><option value="">All chains</option></select></label>
+        <label>TVL band<select id="tvl-band"><option value="">Any TVL</option><option value="under-10">Under $10M</option><option value="10-50">$10M–$50M</option><option value="50-250">$50M–$250M</option><option value="250-1000">$250M–$1B</option><option value="over-1000">$1B+</option></select></label>
+        <label>Status<select id="status"><option value="ranked">Ranked</option><option value="live">Live tokens</option><option value="excluded">Excluded</option></select></label>
+        <button class="quiet-button" id="reset" type="button">Reset filters</button>
+      </div>
+
+      <div class="table-topline"><p id="result" aria-live="polite"></p><p id="page-info"></p></div>
+      <div class="table-frame">
+        <table id="board">
+          <thead><tr>
+            <th><button type="button" data-sort="rank">Rank</button></th>
+            <th>Protocol</th>
+            <th>Category</th>
+            <th>Chain</th>
+            <th><button type="button" data-sort="tvl">TVL</button></th>
+            <th><button type="button" data-sort="value">Implied / market value</button></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="empty-state" class="empty-state" hidden>No matches in this view. Clear a filter or search another protocol.</p>
+      </div>
+      <div class="pager"><button id="previous" type="button" class="quiet-button">← Previous</button><button id="next" type="button" class="quiet-button">Next →</button></div>
+      <p class="board-footnote">Select any row for its model inputs, eligibility note, and complete farm plan. Market capitalization is shown only for recorded live-token rows; ranked values are modeled estimates.</p>
+    </section>
+
+    <section id="record" class="record-panel" hidden aria-live="polite">
+      <a class="record-nav" href="#filter=status:ranked">← Return to the board</a>
+      <p class="eyebrow" id="record-kind"></p>
+      <h2 id="record-name"></h2>
+      <p class="record-subline" id="record-subline"></p>
+      <div id="record-content"></div>
+    </section>
+
+    <section class="method-section" id="method">
+      <div class="section-heading"><div><p class="eyebrow">Methods note</p><h2>How this radar is built</h2></div><p class="section-note">One snapshot, fixed coefficients, explicit limits.</p></div>
+      <div class="method-lede">
+        <p><b>Comps value:</b> <code id="method-formula"></code>. The TVL-only OLS fit uses 128 traded-token comparables; category offset is exactly 0. Fitted log market cap is clipped to [0, 14].</p>
+        <p><b>Token odds:</b> deterministic logistic regression over all snapshot rows using log TVL, log age, clamped seven-day growth, and large-category indicators. See the scored AUCs and fixed learning recipe below.</p>
+        <p><b>Validation:</b> parity of the sum of slug character codes defines A and B; fit A→B and B→A separately. The chronology split trains on listings before 2025-06-01 and tests on later listings. All covariates and labels still come from one sealed snapshot.</p>
+      </div>
+      <div class="eligibility-note">
+        <h3>Eligibility and exclusions</h3>
+        <p>Wrapped, bridge, and staked products are excluded per the brief. Live-token records are separate from the launch ranking.</p>
+        <p id="coverage-note"></p>
+        <ul id="eligibility-rules"></ul>
+      </div>
+      <div class="table-frame comparison-frame">
+        <table class="comparison-table">
+          <thead><tr><th>Candidate</th><th>In-sample R²</th><th>A→B · Log R² / MAPE / MdAPE</th><th>B→A · Log R² / MAPE / MdAPE</th><th>Walk-forward · Log R² / MAPE / MdAPE</th><th>Mean held-out R²</th></tr></thead>
+          <tbody id="comparison"></tbody>
+        </table>
+      </div>
+      <p class="iteration-baseline" id="baseline-note"></p>
+      <div class="assumption-grid">
+        <article><h3>Value of the position</h3><p>Farm plans assume 10% of an implied token value is allocated to farmers and a shared $1,000,000 of farmed capital. Per-row expected value is rounded from <code>implied value × 0.10 × deposit / 1,000,000</code>; net subtracts the deposit and estimated gas.</p></article>
+        <article><h3>Gas budget per interaction</h3><p>USD assumptions: Ethereum $18; Arbitrum, Optimism, Base $0.40; Polygon and BSC $0.30; Solana $0.15; Avalanche $0.60; other chains $0.75. Each plan budgets four interactions on its first listed chain.</p></article>
+        <article><h3>Deposit and hold</h3><p>TVL tiers map to deposits of $50, $100, $150, $200, or $250. Holds are 60 days for age under one year, 45 days under three years, and 30 days otherwise. Plans are templates; verify the live app, contracts, fees, and risks.</p></article>
+        <article class="warning"><h3>Walk-forward caveat</h3><p>The selected model's walk-forward Log R² is −0.421 (MAPE 491.5%). In its 20-row test, rain (listed 2025-10-28; TVL $6.6M, mcap $2.6B) has a +2.93 log residual (~850× fitted); bitway-earn (2026-03-12; $33M, $1.2B) +2.20; and obol (2025-11-04; $1.1B, $717K) −1.87. All remain in the test; no outlier is removed. Jese explicitly relaxed the positivity gate (“ane ga mau tau harus berhasil”); no fit metric changed.</p></article>
+      </div>
+      <p class="auc-note" id="odds-note"></p>
+    </section>
+  </main>
+  <footer><span>LAUNCH RADAR · ITERATION 3</span><span>DefiLlama snapshot · 2026-11-14 · no network requests</span></footer>
 </body>
 </html>
