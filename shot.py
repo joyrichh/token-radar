@@ -1,10 +1,16 @@
 import argparse
 import json
+import subprocess
 import struct
+import tempfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 
 def capture():
@@ -19,6 +25,9 @@ def capture():
     leader = data["rows"][0]["slug"]
     shots = root / "screenshots"
     shots.mkdir(exist_ok=True)
+    if sync_playwright is None:
+        capture_with_chromium(args, output, shots, leader)
+        return
     with sync_playwright() as playwright:
         options = {"executable_path": args.executable} if args.executable else {}
         if args.single_process:
@@ -94,6 +103,60 @@ def capture():
         assert max(width, height) <= 1440 and min(width, height) >= 800
         assert len(content) <= 512 * 1024
         print(f"{image.name}: PNG {width}×{height}, {len(content)} bytes")
+
+
+def capture_with_chromium(args, output, shots, leader):
+    executable = Path(args.executable).resolve() if args.executable else None
+    if executable is None or not executable.is_file():
+        raise RuntimeError("Playwright is unavailable; pass --executable with the bundled Chromium binary.")
+    dashboard = (output / "dashboard" / "index.html").as_uri()
+    renders = [
+        ("1-board.png", dashboard, 1280, 900),
+        ("2-detail.png", f"{dashboard}#detail={quote(leader)}", 1280, 1100),
+        ("3-filtered.png", f"{dashboard}#filter=category:{quote('Dexs')}", 1280, 900),
+    ]
+    with tempfile.TemporaryDirectory(prefix="launch-radar-chrome-") as profile_root:
+        for filename, url, width, height in renders:
+            destination = shots / filename
+            command = [
+                str(executable), "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                "--hide-scrollbars", "--disable-crashpad-for-testing", "--disable-crash-reporter",
+                f"--user-data-dir={profile_root}/{filename}", f"--window-size={width},{height}",
+                "--virtual-time-budget=5000", f"--screenshot={destination}", url,
+            ]
+            if args.single_process:
+                command[1:1] = ["--no-zygote", "--single-process"]
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode:
+                lines = (result.stderr or result.stdout).strip().splitlines()
+                important = [line.strip() for line in lines if "FATAL:" in line or "ERROR:" in line]
+                detail = (important + lines[-3:])[-8:]
+                raise RuntimeError(f"Chromium capture failed for {filename} (exit {result.returncode}): {' | '.join(detail)}")
+            optimize_png(destination)
+            validate_png(destination, width, height)
+
+
+def optimize_png(image):
+    content = image.read_bytes()
+    if len(content) <= 512 * 1024:
+        return
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError(f"{image.name} is over 512 KiB and Pillow is unavailable for PNG quantization.") from error
+    with Image.open(image) as rendered:
+        reduced = rendered.convert("RGB").quantize(colors=192, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+        reduced.save(image, format="PNG", optimize=True)
+
+
+def validate_png(image, expected_width, expected_height):
+    content = image.read_bytes()
+    assert content[:8] == b"\x89PNG\r\n\x1a\n", f"{image.name} is not a PNG"
+    width, height = struct.unpack(">II", content[16:24])
+    assert (width, height) == (expected_width, expected_height), f"{image.name}: unexpected {width}×{height}"
+    assert max(width, height) <= 1440 and min(width, height) >= 800, f"{image.name}: invalid image dimensions"
+    assert len(content) <= 512 * 1024, f"{image.name}: {len(content)} bytes exceeds 512 KiB"
+    print(f"{image.name}: PNG {width}×{height}, {len(content)} bytes")
 
 
 if __name__ == "__main__":
